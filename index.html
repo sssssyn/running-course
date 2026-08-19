@@ -26,6 +26,7 @@
 <div id="ui">
   <input id="km" type="number" value="5" min="0.5" max="42" step="0.5" inputmode="decimal"> km
   <select id="shape"><option value="loop">ループ</option><option value="back">往復</option></select>
+  <select id="mode"><option value="coarse">大まかな道</option><option value="fine">細かい道</option></select>
   <button id="go">コース生成</button>
   <button id="rec">スタート</button>
   <button id="vo" title="音声ナビ">🔊</button>
@@ -35,7 +36,10 @@
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const OSRM = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/';
+const OSRM = 'https://routing.openstreetmap.de/';
+// 大まか: 自転車プロファイル。路地や階段を避け、通り抜けやすい道を選ぶので曲がりが減る
+// 細かい: 徒歩プロファイル。歩道・公園・遊歩道まで使うが、その分こまめに曲がる
+const MODE = {coarse:{path:'routed-bike/route/v1/bike/', n:3}, fine:{path:'routed-foot/route/v1/foot/', n:5}};
 const $ = id => document.getElementById(id);
 const say = t => $('status').textContent = t;
 
@@ -86,14 +90,14 @@ function waypoints(shape, target, scale, seed){
   if(shape === 'back') return [here, dest(lat, lon, seed.dir, target/2*scale), here];
   const r = target/(2*Math.PI)*scale;                 // 円周 = 目標距離 になる半径
   const [clat, clon] = dest(lat, lon, seed.dir, r);   // スタートを通る円の中心
-  const pts = [here], n = 5;
+  const pts = [here], n = seed.n;
   for(let i=1; i<n; i++) pts.push(dest(clat, clon, seed.dir+180 + seed.spin*360*i/n, r));
   pts.push(here);
   return pts;
 }
 
-async function route(pts){
-  const url = OSRM + pts.map(p => p[1]+','+p[0]).join(';')
+async function route(pts, path){
+  const url = OSRM + path + pts.map(p => p[1]+','+p[0]).join(';')
             + '?overview=full&geometries=geojson&steps=true&continue_straight=false';
   const res = await fetch(url);
   if(!res.ok) throw new Error('経路サーバ応答 '+res.status);
@@ -106,13 +110,14 @@ async function generate(){
   if(!start){ say('スタート地点がありません。地図をタップしてください'); return; }
   const target = parseFloat($('km').value), shape = $('shape').value;
   if(!(target > 0)){ say('距離を入力してください'); return; }
-  const seed = {dir: Math.random()*360, spin: Math.random()<0.5 ? 1 : -1};
+  const m = MODE[$('mode').value];
+  const seed = {dir: Math.random()*360, spin: Math.random()<0.5 ? 1 : -1, n: m.n};
   let scale = shape === 'back' ? 0.8 : 1.0, best = null;
   $('go').disabled = true;
   try{
     for(let i=0; i<4; i++){                      // 距離が合うまで縮尺を補正して再探索
       say('生成中… ('+(i+1)+'/4)');
-      const r = await route(waypoints(shape, target, scale, seed));
+      const r = await route(waypoints(shape, target, scale, seed), m.path);
       const km = r.distance/1000;
       if(!best || Math.abs(km-target) < Math.abs(best.km-target)) best = {km, route:r};
       if(Math.abs(km-target)/target < 0.08) break;
@@ -208,6 +213,20 @@ function addPoint(ll, acc){
   stats();
 }
 
+// ponytail: 無音ループ再生でページを「メディア再生中」に見せ、停止されにくくする。
+//           Androidでは延命するがiOSでは保証されない。確実にやるならネイティブアプリ化。
+function silentWav(sec){
+  const rate = 8000, n = rate*sec, buf = new Uint8Array(44+n), dv = new DataView(buf.buffer);
+  const w = (o,t) => { for(let i=0;i<t.length;i++) buf[o+i] = t.charCodeAt(i); };
+  w(0,'RIFF'); dv.setUint32(4, 36+n, true); w(8,'WAVEfmt ');
+  dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,rate,true); dv.setUint32(28,rate,true); dv.setUint16(32,1,true); dv.setUint16(34,8,true);
+  w(36,'data'); dv.setUint32(40,n,true); buf.fill(128,44);        // 8bit無音は128
+  let b = ''; for(const c of buf) b += String.fromCharCode(c);
+  return 'data:audio/wav;base64,' + btoa(b);
+}
+let keep = null;
+
 async function startRec(resume){
   rec = resume || {pts:[], km:0, t0:Date.now()};
   if(trackLine) trackLine.remove();
@@ -215,12 +234,15 @@ async function startRec(resume){
   $('rec').textContent = 'ゴール';
   $('rec').classList.add('on');
   tick = setInterval(stats, 1000);
+  if(!keep){ keep = new Audio(silentWav(1)); keep.loop = true; }
+  keep.play().catch(()=>{});
   try{ wake = await navigator.wakeLock.request('screen'); }catch(e){}  // 画面が消えると測位が止まるため
   stats();
 }
 
 function stopRec(){
   clearInterval(tick); tick = null;
+  if(keep) keep.pause();
   if(wake){ wake.release(); wake = null; }
   const sec = (Date.now()-rec.t0)/1000;
   say('ゴール! '+rec.km.toFixed(2)+' km / '+clock(sec)
@@ -244,10 +266,12 @@ if(location.hash === '#test'){
   const p = dest(35.681, 139.767, 42, 3);
   console.assert(Math.abs(dist([35.681,139.767], p) - 3) < 0.001, 'dest/dist 不一致');
   start = L.latLng(35.681, 139.767);
-  const w = waypoints('loop', 5, 1, {dir:0, spin:1});
+  const w = waypoints('loop', 5, 1, {dir:0, spin:1, n:5});
   const peri = w.slice(1).reduce((s,p,i)=> s + dist(w[i], p), 0);
   console.assert(w.length === 6 && peri > 4 && peri < 5.2, 'ループ周長がおかしい: '+peri);
   console.assert(waypoints('back', 5, 1, {dir:0}).length === 3, '往復の経由点数');
+  console.assert(waypoints('loop', 5, 1, {dir:0, spin:1, n:3}).length === 4, '大まかモードの経由点数');
+  console.assert(silentWav(1).startsWith('data:audio/wav;base64,UklGR'), '無音WAVの生成');
   rec = {pts:[], km:0, t0:Date.now()};
   trackLine = {setLatLngs(){}};
   addPoint(L.latLng(35.681, 139.767), 10);
