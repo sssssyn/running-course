@@ -14,6 +14,8 @@
   #go{background:#e63946;color:#fff;font-weight:bold}
   #go:disabled{opacity:.5}
   #rec{background:#2a9d8f;color:#fff;font-weight:bold}
+  #vo{background:#555;color:#fff}
+  #vo.off{opacity:.45;text-decoration:line-through}
   #rec.on{background:#1e88e5}
   #stats{flex-basis:100%;font-size:22px;font-weight:bold;font-variant-numeric:tabular-nums}
   #status{flex-basis:100%;font-size:14px;color:#bbb}
@@ -26,6 +28,7 @@
   <select id="shape"><option value="loop">ループ</option><option value="back">往復</option></select>
   <button id="go">コース生成</button>
   <button id="rec">スタート</button>
+  <button id="vo" title="音声ナビ">🔊</button>
   <div id="stats"></div>
   <div id="status">現在地を取得中…</div>
 </div>
@@ -55,6 +58,7 @@ if(navigator.geolocation){
     else meMarker = L.circleMarker(ll,{radius:7,color:'#fff',weight:2,fillColor:'#1e88e5',fillOpacity:1}).addTo(map);
     if(!start){ setStart(ll); map.setView(ll,15); say('現在地を取得しました。距離を決めて生成してください'); }
     if(rec) addPoint(ll, p.coords.accuracy);
+    if(nav) navCheck(ll);
   }, err => {
     const why = {1:'ブラウザ/OSで位置情報が拒否されています', 2:'測位できません(OSの位置情報サービスがオフの可能性)', 3:'測位がタイムアウトしました'}[err.code] || err.message;
     if(!start) say('現在地NG: '+why+'。地図をタップしてスタート地点を指定してください');
@@ -90,7 +94,7 @@ function waypoints(shape, target, scale, seed){
 
 async function route(pts){
   const url = OSRM + pts.map(p => p[1]+','+p[0]).join(';')
-            + '?overview=full&geometries=geojson&continue_straight=false';
+            + '?overview=full&geometries=geojson&steps=true&continue_straight=false';
   const res = await fetch(url);
   if(!res.ok) throw new Error('経路サーバ応答 '+res.status);
   const j = await res.json();
@@ -110,12 +114,13 @@ async function generate(){
       say('生成中… ('+(i+1)+'/4)');
       const r = await route(waypoints(shape, target, scale, seed));
       const km = r.distance/1000;
-      if(!best || Math.abs(km-target) < Math.abs(best.km-target)) best = {km, geo:r.geometry};
+      if(!best || Math.abs(km-target) < Math.abs(best.km-target)) best = {km, route:r};
       if(Math.abs(km-target)/target < 0.08) break;
       scale *= target/km;
     }
     if(routeLayer) routeLayer.remove();
-    routeLayer = L.geoJSON(best.geo, {style:{color:'#e63946',weight:5,opacity:.8}}).addTo(map);
+    routeLayer = L.geoJSON(best.route.geometry, {style:{color:'#e63946',weight:5,opacity:.8}}).addTo(map);
+    buildNav(best.route);
     map.fitBounds(routeLayer.getBounds(), {padding:[30,30]});
     say(best.km.toFixed(2)+' km のコースができました(目標 '+target+' km)');
   }catch(e){
@@ -124,7 +129,58 @@ async function generate(){
     $('go').disabled = false;
   }
 }
-$('go').onclick = generate;
+$('go').onclick = () => { speak('コースを作ります'); generate(); };
+
+// --- 音声ナビ ---
+const TURN = {'left':'左', 'sharp left':'左', 'slight left':'左',
+              'right':'右', 'sharp right':'右', 'slight right':'右',
+              'straight':'まっすぐ', 'uturn':'Uターン'};
+let nav = null, voice = true;
+
+function speak(t){
+  if(!voice || !window.speechSynthesis) return;
+  speechSynthesis.cancel();              // 前の読み上げが残ると指示が遅れて流れる
+  const u = new SpeechSynthesisUtterance(t);
+  u.lang = 'ja-JP'; u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+
+function buildNav(route){
+  const steps = [], end = route.legs.length - 1;
+  route.legs.forEach((leg, li) => {
+    for(const st of leg.steps){
+      const m = st.maneuver, pt = [m.location[1], m.location[0]];
+      let text = null;
+      if(m.type === 'arrive') text = li === end ? 'ゴールです' : null;  // 経由点の通過はゴールではない
+      else if(m.type !== 'depart' && TURN[m.modifier] && (m.modifier !== 'straight' || m.type === 'fork'))
+        text = TURN[m.modifier]+'です';
+      if(!text) continue;
+      const prev = steps[steps.length-1];
+      // 曲がり角が連続する区間で予告まで流すと喋りっぱなしになる
+      steps.push({pt, text, quiet: !!prev && dist(prev.pt, pt) < 0.15});
+    }
+  });
+  nav = steps.length ? {steps, i:0, pre:false} : null;
+}
+
+function navCheck(ll){
+  const here = [ll.lat, ll.lng], s = nav.steps[nav.i], next = nav.steps[nav.i+1];
+  const km = dist(here, s.pt);
+  if(km*1000 < 25 || (next && dist(here, next.pt) < km)){   // 通過したら次の指示へ
+    speak(s.text);
+    if(++nav.i >= nav.steps.length) nav = null;
+    else nav.pre = false;
+  } else if(km*1000 < 120 && !nav.pre && !s.quiet){
+    speak('この先'+Math.round(km*100)*10+'メートル、'+s.text);
+    nav.pre = true;
+  }
+}
+
+$('vo').onclick = () => {
+  voice = !voice;
+  $('vo').classList.toggle('off', !voice);
+  if(voice) speak('音声ナビ オン');else speechSynthesis.cancel();
+};
 
 // --- 走行記録 ---
 let rec = null, trackLine = null, tick = null, wake = null;
@@ -175,7 +231,10 @@ function stopRec(){
   $('rec').classList.remove('on');
 }
 
-$('rec').onclick = () => rec ? stopRec() : startRec();
+$('rec').onclick = () => {
+  if(rec){ speak('ゴール'); stopRec(); }
+  else { speak('スタート'); startRec(); }
+};
 
 const saved = localStorage.getItem(KEY);
 if(saved && location.hash !== '#test'){ startRec(JSON.parse(saved)); say('記録中だったので再開しました'); }
@@ -198,6 +257,26 @@ if(location.hash === '#test'){
   console.assert(rec.pts.length === 2, '点の間引きがおかしい: '+rec.pts.length);
   console.assert(Math.abs(rec.km - 1.0) < 0.02, '距離集計がおかしい: '+rec.km);
   rec = null; localStorage.removeItem(KEY);
+  voice = false;
+  buildNav({legs:[{steps:[
+    {maneuver:{type:'depart', modifier:'straight', location:[139.767, 35.681]}},
+    {maneuver:{type:'new name', modifier:'straight', location:[139.767, 35.685]}},
+    {maneuver:{type:'turn', modifier:'slight right', location:[139.767, 35.690]}},
+    {maneuver:{type:'arrive', location:[139.767, 35.700]}}]}]});
+  console.assert(nav.steps.length === 2, '出発と道なりを除外できていない: '+nav.steps.length);
+  buildNav({legs:[
+    {steps:[{maneuver:{type:'turn', modifier:'left', location:[139.767, 35.685]}},
+            {maneuver:{type:'arrive', location:[139.767, 35.690]}}]},
+    {steps:[{maneuver:{type:'depart', modifier:'straight', location:[139.767, 35.690]}},
+            {maneuver:{type:'arrive', location:[139.767, 35.700]}}]}]});
+  console.assert(nav.steps.length === 2, '経由点の到着を除外できていない: '+nav.steps.length);
+  console.assert(nav.steps.map(x=>x.text).join() === '左です,ゴールです', 'ゴールが途中で鳴る: '+nav.steps.map(x=>x.text));
+  console.assert(nav.steps[0].text === '右です', '曲がる向き: '+nav.steps[0].text);
+  navCheck(L.latLng(35.6893, 139.767));            // 約78m手前 -> 事前予告のみ
+  console.assert(nav.i === 0 && nav.pre, '事前予告が出ていない');
+  navCheck(L.latLng(35.6899, 139.767));            // 約11m -> 通過して次へ
+  console.assert(nav.i === 1 && !nav.pre, '手順が進まない: '+nav.i);
+  nav = null; voice = true;
   say('self-test 完了(コンソール確認)');
 }
 </script>
