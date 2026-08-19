@@ -13,6 +13,9 @@
   #km{width:5em}
   #go{background:#e63946;color:#fff;font-weight:bold}
   #go:disabled{opacity:.5}
+  #rec{background:#2a9d8f;color:#fff;font-weight:bold}
+  #rec.on{background:#1e88e5}
+  #stats{flex-basis:100%;font-size:22px;font-weight:bold;font-variant-numeric:tabular-nums}
   #status{flex-basis:100%;font-size:14px;color:#bbb}
   #map{flex:1}
 </style>
@@ -22,6 +25,8 @@
   <input id="km" type="number" value="5" min="0.5" max="42" step="0.5" inputmode="decimal"> km
   <select id="shape"><option value="loop">ループ</option><option value="back">往復</option></select>
   <button id="go">コース生成</button>
+  <button id="rec">スタート</button>
+  <div id="stats"></div>
   <div id="status">現在地を取得中…</div>
 </div>
 <div id="map"></div>
@@ -49,6 +54,7 @@ if(navigator.geolocation){
     if(meMarker) meMarker.setLatLng(ll);
     else meMarker = L.circleMarker(ll,{radius:7,color:'#fff',weight:2,fillColor:'#1e88e5',fillOpacity:1}).addTo(map);
     if(!start){ setStart(ll); map.setView(ll,15); say('現在地を取得しました。距離を決めて生成してください'); }
+    if(rec) addPoint(ll, p.coords.accuracy);
   }, err => {
     const why = {1:'ブラウザ/OSで位置情報が拒否されています', 2:'測位できません(OSの位置情報サービスがオフの可能性)', 3:'測位がタイムアウトしました'}[err.code] || err.message;
     if(!start) say('現在地NG: '+why+'。地図をタップしてスタート地点を指定してください');
@@ -120,6 +126,60 @@ async function generate(){
 }
 $('go').onclick = generate;
 
+// --- 走行記録 ---
+let rec = null, trackLine = null, tick = null, wake = null;
+const KEY = 'run-track';
+const clock = s => Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
+
+function stats(){
+  if(!rec) return;
+  const sec = (Date.now()-rec.t0)/1000;
+  $('stats').textContent = rec.km.toFixed(2)+' km   '+clock(sec)
+    + (rec.km > 0.05 ? '   '+clock(sec/rec.km)+'/km' : '');
+}
+
+function addPoint(ll, acc){
+  if(acc > 30) return;                        // 精度が悪い測位は距離を狂わせるので捨てる
+  const p = [ll.lat, ll.lng], last = rec.pts[rec.pts.length-1];
+  if(last){
+    const d = dist(last, p);
+    if(d < 0.005) return;                     // 5m未満は静止中のGPSゆらぎとみなす
+    rec.km += d;
+  }
+  rec.pts.push(p);
+  trackLine.setLatLngs(rec.pts);
+  localStorage.setItem(KEY, JSON.stringify(rec));   // 途中でリロードされても失わない
+  stats();
+}
+
+async function startRec(resume){
+  rec = resume || {pts:[], km:0, t0:Date.now()};
+  if(trackLine) trackLine.remove();
+  trackLine = L.polyline(rec.pts, {color:'#1e88e5', weight:6, opacity:.9}).addTo(map);
+  $('rec').textContent = 'ゴール';
+  $('rec').classList.add('on');
+  tick = setInterval(stats, 1000);
+  try{ wake = await navigator.wakeLock.request('screen'); }catch(e){}  // 画面が消えると測位が止まるため
+  stats();
+}
+
+function stopRec(){
+  clearInterval(tick); tick = null;
+  if(wake){ wake.release(); wake = null; }
+  const sec = (Date.now()-rec.t0)/1000;
+  say('ゴール! '+rec.km.toFixed(2)+' km / '+clock(sec)
+      + (rec.km > 0.05 ? ' / 平均 '+clock(sec/rec.km)+'/km' : ''));
+  rec = null;
+  localStorage.removeItem(KEY);
+  $('rec').textContent = 'スタート';
+  $('rec').classList.remove('on');
+}
+
+$('rec').onclick = () => rec ? stopRec() : startRec();
+
+const saved = localStorage.getItem(KEY);
+if(saved && location.hash !== '#test'){ startRec(JSON.parse(saved)); say('記録中だったので再開しました'); }
+
 // #test で自己チェック
 if(location.hash === '#test'){
   const p = dest(35.681, 139.767, 42, 3);
@@ -129,6 +189,15 @@ if(location.hash === '#test'){
   const peri = w.slice(1).reduce((s,p,i)=> s + dist(w[i], p), 0);
   console.assert(w.length === 6 && peri > 4 && peri < 5.2, 'ループ周長がおかしい: '+peri);
   console.assert(waypoints('back', 5, 1, {dir:0}).length === 3, '往復の経由点数');
+  rec = {pts:[], km:0, t0:Date.now()};
+  trackLine = {setLatLngs(){}};
+  addPoint(L.latLng(35.681, 139.767), 10);
+  addPoint(L.latLng(35.681, 139.767), 10);   // 同地点 -> 間引き
+  addPoint(L.latLng(35.690, 139.767), 99);   // 精度99m -> 破棄
+  addPoint(L.latLng(35.690, 139.767), 10);   // 約1km先
+  console.assert(rec.pts.length === 2, '点の間引きがおかしい: '+rec.pts.length);
+  console.assert(Math.abs(rec.km - 1.0) < 0.02, '距離集計がおかしい: '+rec.km);
+  rec = null; localStorage.removeItem(KEY);
   say('self-test 完了(コンソール確認)');
 }
 </script>
