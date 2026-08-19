@@ -96,9 +96,22 @@ function waypoints(shape, target, scale, seed){
   return pts;
 }
 
-async function route(pts, path){
+// 同じ道を二度通っている割合。約10m四方のマスに落として、2回以上通ったマスを数える
+function overlap(geo){
+  const cells = new Map();
+  for(const [lon, lat] of geo.coordinates){
+    const k = Math.round(lat*11000) + ',' + Math.round(lon*9000);
+    cells.set(k, (cells.get(k)||0) + 1);
+  }
+  let dup = 0;
+  for(const v of cells.values()) if(v > 1) dup++;
+  return dup / cells.size;
+}
+
+async function route(pts, path, straight){
+  // 経由点でのUターンを禁じると行き止まりへの突入が減る。往復は折り返しが要るので許可する
   const url = OSRM + path + pts.map(p => p[1]+','+p[0]).join(';')
-            + '?overview=full&geometries=geojson&steps=true&continue_straight=false';
+            + '?overview=full&geometries=geojson&steps=true&continue_straight=' + (straight ? 'true' : 'false');
   const res = await fetch(url);
   if(!res.ok) throw new Error('経路サーバ応答 '+res.status);
   const j = await res.json();
@@ -110,18 +123,21 @@ async function generate(){
   if(!start){ say('スタート地点がありません。地図をタップしてください'); return; }
   const target = parseFloat($('km').value), shape = $('shape').value;
   if(!(target > 0)){ say('距離を入力してください'); return; }
-  const m = MODE[$('mode').value];
-  const seed = {dir: Math.random()*360, spin: Math.random()<0.5 ? 1 : -1, n: m.n};
-  let scale = shape === 'back' ? 0.8 : 1.0, best = null;
+  const m = MODE[$('mode').value], loop = shape === 'loop';
+  const reroll = () => ({dir: Math.random()*360, spin: Math.random()<0.5 ? 1 : -1, n: m.n});
+  let seed = reroll(), scale = loop ? 1.0 : 0.8, best = null;
   $('go').disabled = true;
   try{
-    for(let i=0; i<4; i++){                      // 距離が合うまで縮尺を補正して再探索
-      say('生成中… ('+(i+1)+'/4)');
-      const r = await route(waypoints(shape, target, scale, seed), m.path);
-      const km = r.distance/1000;
-      if(!best || Math.abs(km-target) < Math.abs(best.km-target)) best = {km, route:r};
-      if(Math.abs(km-target)/target < 0.08) break;
-      scale *= target/km;
+    for(let i=0; i<5; i++){
+      say('生成中… ('+(i+1)+'/5)');
+      const r = await route(waypoints(shape, target, scale, seed), m.path, loop);
+      const km = r.distance/1000, err = Math.abs(km-target)/target;
+      const ov = loop ? overlap(r.geometry) : 0;   // 往復は同じ道を戻るので対象外
+      if(!best || err + ov < best.score) best = {km, route:r, score: err + ov};
+      if(err < 0.08 && ov < 0.15) break;
+      if(err < 0.12 && ov >= 0.15){                // 距離は足りている。折り返しが多いので方角ごと引き直す
+        seed = reroll(); scale = loop ? 1.0 : 0.8;
+      } else scale *= target/km;                   // 距離が合っていないので縮尺を補正
     }
     if(routeLayer) routeLayer.remove();
     routeLayer = L.geoJSON(best.route.geometry, {style:{color:'#e63946',weight:5,opacity:.8}}).addTo(map);
@@ -272,6 +288,10 @@ if(location.hash === '#test'){
   console.assert(waypoints('back', 5, 1, {dir:0}).length === 3, '往復の経由点数');
   console.assert(waypoints('loop', 5, 1, {dir:0, spin:1, n:3}).length === 4, '大まかモードの経由点数');
   console.assert(silentWav(1).startsWith('data:audio/wav;base64,UklGR'), '無音WAVの生成');
+  console.assert(overlap({coordinates:[[136.600,35.37],[136.601,35.37],[136.602,35.37]]}) === 0,
+                 '一本道で折り返しを誤検出');
+  console.assert(overlap({coordinates:[[136.600,35.37],[136.601,35.37],[136.600,35.37],[136.599,35.37]]}) > 0.3,
+                 '折り返しを検出できない');
   rec = {pts:[], km:0, t0:Date.now()};
   trackLine = {setLatLngs(){}};
   addPoint(L.latLng(35.681, 139.767), 10);
