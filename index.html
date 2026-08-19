@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ランコース生成</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html,body{margin:0;height:100%;font:16px/1.4 system-ui,sans-serif}
+  body{display:flex;flex-direction:column}
+  #ui{padding:10px;background:#222;color:#eee;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  #ui input,#ui select,#ui button{font:inherit;padding:8px;border-radius:6px;border:0}
+  #km{width:5em}
+  #go{background:#e63946;color:#fff;font-weight:bold}
+  #go:disabled{opacity:.5}
+  #status{flex-basis:100%;font-size:14px;color:#bbb}
+  #map{flex:1}
+</style>
+</head>
+<body>
+<div id="ui">
+  <input id="km" type="number" value="5" min="0.5" max="42" step="0.5" inputmode="decimal"> km
+  <select id="shape"><option value="loop">ループ</option><option value="back">往復</option></select>
+  <button id="go">コース生成</button>
+  <div id="status">現在地を取得中…</div>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const OSRM = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/';
+const $ = id => document.getElementById(id);
+const say = t => $('status').textContent = t;
+
+const map = L.map('map').setView([35.681,139.767], 14);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+
+let start = null, startMarker = null, meMarker = null, routeLayer = null;
+
+function setStart(ll){
+  start = ll;
+  if(startMarker) startMarker.setLatLng(ll); else startMarker = L.marker(ll).addTo(map);
+}
+map.on('click', e => { setStart(e.latlng); say('スタート地点を設定しました'); });
+
+if(navigator.geolocation){
+  navigator.geolocation.watchPosition(p => {
+    const ll = L.latLng(p.coords.latitude, p.coords.longitude);
+    if(meMarker) meMarker.setLatLng(ll);
+    else meMarker = L.circleMarker(ll,{radius:7,color:'#fff',weight:2,fillColor:'#1e88e5',fillOpacity:1}).addTo(map);
+    if(!start){ setStart(ll); map.setView(ll,15); say('現在地を取得しました。距離を決めて生成してください'); }
+  }, err => {
+    const why = {1:'ブラウザ/OSで位置情報が拒否されています', 2:'測位できません(OSの位置情報サービスがオフの可能性)', 3:'測位がタイムアウトしました'}[err.code] || err.message;
+    if(!start) say('現在地NG: '+why+'。地図をタップしてスタート地点を指定してください');
+  },
+     {enableHighAccuracy:true, timeout:10000, maximumAge:5000});
+} else say('地図をタップしてスタート地点を指定してください');
+
+// --- 球面座標 ---
+const R = 6371, rad = d => d*Math.PI/180, deg = r => r*180/Math.PI;
+function dest(lat, lon, brg, d){
+  const f1=rad(lat), l1=rad(lon), t=rad(brg), s=d/R;
+  const f2 = Math.asin(Math.sin(f1)*Math.cos(s) + Math.cos(f1)*Math.sin(s)*Math.cos(t));
+  const l2 = l1 + Math.atan2(Math.sin(t)*Math.sin(s)*Math.cos(f1), Math.cos(s)-Math.sin(f1)*Math.sin(f2));
+  return [deg(f2), ((deg(l2)+540)%360)-180];
+}
+function dist(a, b){
+  const df=rad(b[0]-a[0]), dl=rad(b[1]-a[1]);
+  const h = Math.sin(df/2)**2 + Math.cos(rad(a[0]))*Math.cos(rad(b[0]))*Math.sin(dl/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+
+// 目標距離ぶんの経由点。scale は直線距離と実際の道のりのズレを吸収する係数
+function waypoints(shape, target, scale, seed){
+  const lat = start.lat, lon = start.lng, here = [lat, lon];
+  if(shape === 'back') return [here, dest(lat, lon, seed.dir, target/2*scale), here];
+  const r = target/(2*Math.PI)*scale;                 // 円周 = 目標距離 になる半径
+  const [clat, clon] = dest(lat, lon, seed.dir, r);   // スタートを通る円の中心
+  const pts = [here], n = 5;
+  for(let i=1; i<n; i++) pts.push(dest(clat, clon, seed.dir+180 + seed.spin*360*i/n, r));
+  pts.push(here);
+  return pts;
+}
+
+async function route(pts){
+  const url = OSRM + pts.map(p => p[1]+','+p[0]).join(';')
+            + '?overview=full&geometries=geojson&continue_straight=false';
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('経路サーバ応答 '+res.status);
+  const j = await res.json();
+  if(j.code !== 'Ok' || !j.routes || !j.routes.length) throw new Error(j.message || '経路が見つかりません');
+  return j.routes[0];
+}
+
+async function generate(){
+  if(!start){ say('スタート地点がありません。地図をタップしてください'); return; }
+  const target = parseFloat($('km').value), shape = $('shape').value;
+  if(!(target > 0)){ say('距離を入力してください'); return; }
+  const seed = {dir: Math.random()*360, spin: Math.random()<0.5 ? 1 : -1};
+  let scale = shape === 'back' ? 0.8 : 1.0, best = null;
+  $('go').disabled = true;
+  try{
+    for(let i=0; i<4; i++){                      // 距離が合うまで縮尺を補正して再探索
+      say('生成中… ('+(i+1)+'/4)');
+      const r = await route(waypoints(shape, target, scale, seed));
+      const km = r.distance/1000;
+      if(!best || Math.abs(km-target) < Math.abs(best.km-target)) best = {km, geo:r.geometry};
+      if(Math.abs(km-target)/target < 0.08) break;
+      scale *= target/km;
+    }
+    if(routeLayer) routeLayer.remove();
+    routeLayer = L.geoJSON(best.geo, {style:{color:'#e63946',weight:5,opacity:.8}}).addTo(map);
+    map.fitBounds(routeLayer.getBounds(), {padding:[30,30]});
+    say(best.km.toFixed(2)+' km のコースができました(目標 '+target+' km)');
+  }catch(e){
+    say('生成に失敗: '+e.message);
+  }finally{
+    $('go').disabled = false;
+  }
+}
+$('go').onclick = generate;
+
+// #test で自己チェック
+if(location.hash === '#test'){
+  const p = dest(35.681, 139.767, 42, 3);
+  console.assert(Math.abs(dist([35.681,139.767], p) - 3) < 0.001, 'dest/dist 不一致');
+  start = L.latLng(35.681, 139.767);
+  const w = waypoints('loop', 5, 1, {dir:0, spin:1});
+  const peri = w.slice(1).reduce((s,p,i)=> s + dist(w[i], p), 0);
+  console.assert(w.length === 6 && peri > 4 && peri < 5.2, 'ループ周長がおかしい: '+peri);
+  console.assert(waypoints('back', 5, 1, {dir:0}).length === 3, '往復の経由点数');
+  say('self-test 完了(コンソール確認)');
+}
+</script>
+</body>
+</html>
